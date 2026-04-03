@@ -1,0 +1,143 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId} (matches auth.uid)
+    // Fields:
+    //   - email: string (required) - User's email address
+    //   - role: string (required, 'admin' or 'user') - User's role
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: quotes
+    // Document ID: auto-generated
+    // Fields:
+    //   - text: string (required, max 2000 chars)
+    //   - author: string (required, max 100 chars)
+    //   - createdAt: timestamp (required)
+    //   - createdBy: string (required, matches auth.uid)
+    //
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (
+          (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+          (request.auth.token.email.lower() == "amanuelyohannes929@gmail.com")
+        );
+    }
+
+    function hasOnlyAllowedFields(allowedFields) {
+      return request.resource.data.keys().hasOnly(allowedFields);
+    }
+
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['email', 'role', 'createdAt', 'displayName', 'bio', 'dismissedNotifs', 'notificationPrefs']) &&
+             data.email is string && data.email.size() > 0 && data.email.size() < 100 &&
+             data.role in ['admin', 'user'] &&
+             data.createdAt is timestamp &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 50)) &&
+             (!('bio' in data) || (data.bio is string && data.bio.size() <= 200)) &&
+             (!('dismissedNotifs' in data) || (data.dismissedNotifs is list && data.dismissedNotifs.size() <= 100)) &&
+             (!('notificationPrefs' in data) || (
+               data.notificationPrefs is map &&
+               (!('quoteNotifications' in data.notificationPrefs) || data.notificationPrefs.quoteNotifications is bool) &&
+               (!('systemNotifications' in data.notificationPrefs) || data.notificationPrefs.systemNotifications is bool)
+             ));
+    }
+
+    function isValidQuote(data, isUpdate) {
+      return hasOnlyAllowedFields(['text', 'author', 'category', 'status', 'createdAt', 'createdBy']) &&
+             data.text is string && data.text.size() > 0 && data.text.size() <= 2000 &&
+             data.author is string && data.author.size() > 0 && data.author.size() <= 100 &&
+             (!('category' in data) || (data.category is string && data.category.size() <= 50)) &&
+             (!('status' in data) || data.status in ['published', 'draft', 'rejected']) &&
+             data.createdAt is timestamp &&
+             (
+               (isUpdate && !('createdBy' in data)) || 
+               (data.createdBy is string && (isUpdate ? data.createdBy == resource.data.createdBy : data.createdBy == request.auth.uid))
+             );
+    }
+
+    function isValidFavorite(data) {
+      return hasOnlyAllowedFields(['quoteId', 'createdAt']) &&
+             data.quoteId is string &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return hasOnlyAllowedFields(['title', 'message', 'type', 'createdAt', 'link', 'targetUserId']) &&
+             data.title is string && data.title.size() > 0 && data.title.size() <= 100 &&
+             data.message is string && data.message.size() > 0 && data.message.size() <= 500 &&
+             data.type in ['quote', 'system'] &&
+             data.createdAt is timestamp &&
+             (!('link' in data) || (data.link is string && data.link.size() <= 200)) &&
+             (!('targetUserId' in data) || (data.targetUserId is string && data.targetUserId.size() <= 100));
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated();
+      allow create: if isAdmin() && isValidNotification(request.resource.data);
+      allow delete: if isAdmin() || (isAuthenticated() && resource.data.targetUserId == request.auth.uid);
+    }
+
+    match /users/{userId} {
+      // Users can read their own profile, admins can read all profiles
+      allow read: if isOwner(userId) || isAdmin();
+
+      // Users can create their own profile. Only admins can create admin profiles.
+      // The default admin (Amanuelyohannes929@gmail.com) can create an admin profile.
+      allow create: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data) &&
+                    (request.resource.data.role == 'user' || isAdmin());
+
+      // Users can update their own profile but cannot change their role.
+      // Admins can update any user's role, but cannot change their email or createdAt.
+      allow update: if isAuthenticated() && isValidUser(request.resource.data) &&
+                    (
+                      (isOwner(userId) && request.resource.data.role == resource.data.role) ||
+                      (isAdmin() && request.resource.data.email == resource.data.email && request.resource.data.createdAt == resource.data.createdAt)
+                    );
+
+      match /favorites/{quoteId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidFavorite(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      match /fcm_tokens/{tokenId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    match /quotes/{quoteId} {
+      // Anyone authenticated can read published quotes. Admins can read all.
+      allow read: if isAuthenticated() && (resource.data.status == 'published' || isAdmin());
+
+      // Only admins can create quotes
+      allow create: if isAdmin() && isValidQuote(request.resource.data, false);
+
+      // Only admins can update quotes
+      allow update: if isAdmin() && isValidQuote(request.resource.data, true);
+
+      // Only admins can delete quotes
+      allow delete: if isAdmin();
+    }
+  }
+}
